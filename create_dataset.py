@@ -10,11 +10,16 @@ from scapy.all import *
 #FLOW_DURATION = 1 #seconds
 PCKT_NUMBER = 6
 UDP_DURATION = 400 #seconds
-LABEL = "benign"
+LABEL = "attack"
 
-DIR_PATH = "./benign/"
-DATASET_PATH = "./dataset_"+str(PCKT_NUMBER)+".csv"
+DIR_PATH = "./attack/"
 MIN_PCKT = 2
+OVERLAP = True
+
+if OVERLAP:    
+    DATASET_PATH = "./overlap_dataset_"+str(PCKT_NUMBER)+".csv"
+else:
+    DATASET_PATH = "./dataset_"+str(PCKT_NUMBER)+".csv"
 
 PCKT_CONTAINER = {}   # { flow_id: [pckt_list]  }
 TIMESTAMP = {}        # {flow_id: timestamp }
@@ -23,6 +28,7 @@ FLOW_COUNTER = {}     # {flow_id: counter}
 SUB_FLOW_COUNTER = {} # {flow_id: counter}
 FEATURES = []         # [{ flow_id, protocol, bytes_received in last 1s
                       # packet received in last 1s, avg pckt size in last 1s, Label}]
+GRACEFUL_TRACKER = {} # {flow_id: FIN_COUNT} # if FIN count is 2, then TCP session is terminated gracefully
 
 
 def process_pcap(fpath, file_id):
@@ -126,29 +132,60 @@ def process_pcap(fpath, file_id):
     FEATURES = []         # [{ flow_id, protocol, bytes_received in last 1s
 
 def check_flow_termination(pkt, flow_id, protocol, file_id):
-    # termination in 2 ways 
-    # 1. flow_duration is complete
-    # 2. TCP FIN is activated or UDP duration is complete
     if len(PCKT_CONTAINER[flow_id])<PCKT_NUMBER: # flow duration is not complete
         PCKT_CONTAINER[flow_id].append(pkt)
     
     else: # pckt count is complete
         calc_features(PCKT_CONTAINER[flow_id], flow_id, protocol, file_id)
         SUB_FLOW_COUNTER[flow_id] += 1
-        del PCKT_CONTAINER[flow_id]
+        if OVERLAP:
+            PCKT_CONTAINER[flow_id].pop(0)
+        else:
+            del PCKT_CONTAINER[flow_id]
         return
 
-    if protocol == "6": # check FIN for TCP
-        FIN = 0x01
-        ACK = 0x10
+    # TCP connection can be  terminated in two ways 1. graceful termination and 2. abrupt termination
+    # abrupt termination: RESET flag is set (by one host) to terminate abruptly.
+    # No further communication happens if RESET flag is received.
+
+    # graceful termination: 
+    # tclient.net.39904 >telnet.com.23: F 14:14(0) ack 186 win 8760 (DF) 
+    # telnet.com.23 > tclient.net.39904: . ack 15 win 1024 (DF)
+    # telnet.com.23 > tclient.net.39904: F 186:186(0) ack 15 win 1024 (DF) 
+    # tclient.net.39904 > telnet.com.23: . ack 187 win 8760 (DF) 
+
+    # FIN = 0x01
+    # SYN = 0x02
+    # RST = 0x04
+    # PSH = 0x08
+    # ACK = 0x10
+    # URG = 0x20
+    # ECE = 0x40
+    # CWR = 0x80
+
+    if protocol == "6": # check for TCP
         FLAGS = pkt['TCP'].flags
-        if (FLAGS & FIN) and (FLAGS & ACK): # FIN ACK activated
-            #if len(PCKT_CONTAINER[flow_id])>=PCKT_NUMBER:
+        # abrupt termination
+        RST = 0x04
+        if (FLAGS & RST):
             calc_features(PCKT_CONTAINER[flow_id], flow_id, protocol, file_id)
             FLOW_COUNTER[flow_id] += 1
             SUB_FLOW_COUNTER[flow_id] = 1
             del PCKT_CONTAINER[flow_id]
-            #del FLOW_TIME[flow_id]
+
+        # graceful termination
+        FIN = 0x01
+        if (FLAGS & FIN): # FIN activated
+            if flow_id in GRACEFUL_TRACKER.keys():
+                # flow is terminated
+                del GRACEFUL_TRACKER[flow_id]
+                calc_features(PCKT_CONTAINER[flow_id], flow_id, protocol, file_id)
+                FLOW_COUNTER[flow_id] += 1
+                SUB_FLOW_COUNTER[flow_id] = 1
+                del PCKT_CONTAINER[flow_id]
+
+            else:
+                GRACEFUL_TRACKER[flow_id] = 1
 
     elif protocol == "17": # check flow duration for UDP
         #if len(PCKT_CONTAINER[flow_id])>=PCKT_NUMBER:
